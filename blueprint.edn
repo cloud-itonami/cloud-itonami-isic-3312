@@ -1,0 +1,11 @@
+{:itonami.blueprint/id "cloud-itonami-3312"
+ :itonami.blueprint/name "Community Industrial Machinery Repair Operations"
+ :itonami.blueprint/isic-rev5 "3312"
+ :itonami.blueprint/domain :manufacturing/machinery-repair
+ :itonami.blueprint/license "AGPL-3.0-or-later"
+ :itonami.blueprint/social-impact [:worker-safety :supply-resilience :waste-reduction]
+ :itonami.blueprint/governor :machinery-repair-governor
+ :itonami.blueprint/robotics true
+ :itonami.blueprint/required-technologies [:robotics :identity :forms :dmn :bpmn :audit-ledger :eda :cae]
+ :itonami.blueprint/optional-technologies []
+ :itonami.blueprint/status :public-oss}
