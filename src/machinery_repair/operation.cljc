@@ -22,7 +22,8 @@
   (:require [langgraph.graph :as g]
             [machinery-repair.advisor :as advisor]
             [machinery-repair.governor :as governor]
-            [machinery-repair.phase :as phase]))
+            [machinery-repair.phase :as phase]
+            [machinery-repair.store :as store]))
 
 (defn- commit-fact [request context proposal]
   {:t          :committed
@@ -104,14 +105,18 @@
                           :subject (:subject request)
                           :phase (:phase context)})}))
 
-      ;; Terminal node (commit)
+      ;; Terminal node (commit) -- every commit/hold/escalate outcome lands
+      ;; in the store's append-only ledger (store/append-ledger!), not just
+      ;; the graph run's transient :audit channel.
       (g/add-node :commit
         (fn [{:keys [disposition audit]}]
-          (case disposition
-            :commit {:audit (conj audit {:t :operation-complete :status :committed})}
-            :hold   {:audit (conj audit {:t :operation-complete :status :held})}
-            :escalate {:audit (conj audit {:t :operation-complete :status :escalated})}
-            {:audit audit})))
+          (let [final (case disposition
+                        :commit   {:t :operation-complete :status :committed}
+                        :hold     {:t :operation-complete :status :held}
+                        :escalate {:t :operation-complete :status :escalated}
+                        {:t :operation-complete :status :unknown})]
+            (store/append-ledger! store final)
+            {:audit (conj audit final)})))
 
       ;; Edges: standard flow
       (g/add-edge :intake :advise)
@@ -119,7 +124,7 @@
       (g/add-edge :govern :decide)
 
       ;; From decide: to approval or commit
-      (g/add-conditional-edge :decide
+      (g/add-conditional-edges :decide
         (fn [{:keys [disposition]}]
           (if (= disposition :escalate) :request-approval :commit))
         {:request-approval :request-approval :commit :commit})
@@ -131,4 +136,4 @@
       (g/set-entry-point :intake)
       (g/set-finish-point :commit)
 
-      (g/compile)))
+      (g/compile-graph)))

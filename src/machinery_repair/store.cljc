@@ -33,10 +33,14 @@
   (repair-work-complete? [this repair-id]
     "Check if hands-on repair work is marked complete by technician.")
   (repair-safely-deliverable? [this repair-id]
-    "Check if repair passes all safe-delivery conditions."))
+    "Check if repair passes all safe-delivery conditions.")
+  (ledger [this]
+    "The append-only immutable decision-fact log.")
+  (append-ledger! [this fact]
+    "Append one immutable decision fact (commit/hold/escalate outcome)."))
 
 (deftype MemStore [clients-db equipment-db intakes-db technicians-db
-                   safety-flags-db parts-orders-db work-history]
+                   safety-flags-db parts-orders-db work-history ledger-db]
   Store
   (client-record [_ client-id]
     (get @clients-db client-id))
@@ -91,7 +95,14 @@
     (let [intake (get @intakes-db repair-id)]
       (and (repair-work-complete? _ repair-id)
            (every? #(contains? (set (:delivery-checks intake [])) %)
-                   facts/safe-delivery-checklist)))))
+                   facts/safe-delivery-checklist))))
+
+  (ledger [_]
+    @ledger-db)
+
+  (append-ledger! [_ fact]
+    (swap! ledger-db conj fact)
+    fact))
 
 (defn mem-store
   "Create an in-memory store with optional initial data.
@@ -104,7 +115,8 @@
               (atom {})
               (atom {})
               (atom {})
-              (atom {})))
+              (atom {})
+              (atom [])))
   ([{:keys [clients equipment intakes technicians safety-flags parts-orders work-history]}]
    (MemStore. (atom (or clients {}))
               (atom (or equipment {}))
@@ -112,4 +124,5 @@
               (atom (or technicians {}))
               (atom (or safety-flags {}))
               (atom (or parts-orders {}))
-              (atom (or work-history {})))))
+              (atom (or work-history {}))
+              (atom []))))
