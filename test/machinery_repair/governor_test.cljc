@@ -37,6 +37,49 @@
       (is (not (:ok? verdict)))
       (is (:hard? verdict)))))
 
+(deftest check-map-subject-resolves-client-id
+  (testing "A map-shaped subject resolves :client-id -- a verified client plus
+           verified equipment clears every HARD rule for dispatch"
+    (let [clients {"client-123" {:client-id "client-123"
+                                 :client-name "Test"
+                                 :contact-phone "555-1234"
+                                 :contact-email "test@example.com"}}
+          equipment {"eq-1" {:equipment-id "eq-1"
+                             :equipment-type "pump"
+                             :model "P-100"
+                             :serial-number "SN-1"
+                             :site-location "Bay 3"
+                             :failure-description "seal leak"}}
+          s (store/mem-store {:clients clients :equipment equipment})
+          request {:op :schedule-technician-dispatch
+                   :subject {:client-id "client-123" :equipment-id "eq-1"
+                             :technician-id "tech-1"}}
+          verdict (governor/check request {} {:confidence 0.9} s)]
+      (is (not (:hard? verdict)))
+      (is (empty? (:violations verdict)))
+      (is (:ok? verdict)))))
+
+(deftest check-safety-flag-blocks-parts-order
+  (testing "An unresolved safety flag HARD-holds a parts order on verified equipment"
+    (let [clients {"client-123" {:client-id "client-123"
+                                 :client-name "Test"
+                                 :contact-phone "555-1234"
+                                 :contact-email "test@example.com"}}
+          equipment {"eq-9" {:equipment-id "eq-9"
+                             :equipment-type "turbine"
+                             :model "T-9"
+                             :serial-number "SN-9"
+                             :site-location "Hall B"
+                             :failure-description "vibration"}}
+          flags {"eq-9" {:equipment-id "eq-9" :status :unresolved}}
+          s (store/mem-store {:clients clients :equipment equipment
+                              :safety-flags flags})
+          request {:op :order-parts
+                   :subject {:client-id "client-123" :equipment-id "eq-9"}}
+          verdict (governor/check request {} {:confidence 0.9} s)]
+      (is (:hard? verdict))
+      (is (some #(= :safety-flag-unresolved (:rule %)) (:violations verdict))))))
+
 (deftest check-low-confidence
   (testing "Low confidence triggers escalation"
     (let [clients {"client-123" {:client-id "client-123"
