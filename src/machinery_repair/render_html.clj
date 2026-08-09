@@ -1,0 +1,591 @@
+(ns machinery-repair.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2 for this repo: there was previously no
+  demo page and no generator at all (the `:run` alias still points at a
+  `machinery-repair.sim` namespace that does not exist on `main`, so there
+  was no working driver either).
+
+  EVERY id, status, disposition and hold reason on the generated page is
+  produced by actually executing this repo's own actor at build time --
+  `machinery-repair.operation/build` compiles the real langgraph StateGraph
+  (`:intake` -> `:advise` -> `:govern` -> `:decide` -> `:request-approval` |
+  `:commit`), which runs the real `machinery-repair.advisor/mock-advisor`,
+  the real `machinery-repair.governor/check` and the real
+  `machinery-repair.store` MemStore. Nothing on the page is hand-typed
+  actor output: the verification columns come from `store/has-verified-client?`
+  / `store/has-verified-equipment?` / `store/safety-flag-exists?` /
+  `store/repair-work-complete?` / `store/repair-safely-deliverable?`, the
+  dispositions and hold rules come from the graph runs' `:audit` channel and
+  the store's append-only `store/ledger`, and the governor rule matrix is
+  derived from the live `governor/requires-verified-client`,
+  `governor/requires-verified-equipment`, `governor/escalation-required` and
+  `phase/phase-definitions` vars rather than being described by hand.
+
+  Only the SEED (`demo-seed` below -- clients, equipment, technicians,
+  intakes, one unresolved safety flag, prior work history) is authored data,
+  the way any fixture is; the store this repo ships has no `demo-data` var
+  to reuse.
+
+  Deterministic by construction: no timestamps, no randomness (the seeded
+  safety flag is supplied through `store/mem-store` rather than through
+  `store/add-safety-flag`, which mints a `random-uuid` flag id), and every
+  table is sorted by a stable key -- two consecutive runs are byte-identical.
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [clojure.string :as str]
+            [jp-go-dds.skin]
+            [langgraph.graph :as g]
+            [machinery-repair.facts :as facts]
+            [machinery-repair.governor :as governor]
+            [machinery-repair.operation :as operation]
+            [machinery-repair.phase :as phase]
+            [machinery-repair.store :as store]))
+
+;; ----------------------------- seed -----------------------------
+
+(def demo-seed
+  "Fixture for one repair shop. `client-2` is deliberately missing
+  `:contact-email` and `eq-102` is missing most of
+  `facts/equipment-verification-required`, so the governor's verification
+  rules have something real to reject; `eq-103` is fully specified but
+  carries an unresolved safety flag."
+  {:clients
+   {"client-1" {:client-id "client-1"
+                :client-name "Kizuna Metalworks"
+                :contact-phone "+81-6-6000-1101"
+                :contact-email "maintenance@kizuna-metalworks.example"}
+    "client-2" {:client-id "client-2"
+                :client-name "Tsubame Forming Works"
+                :contact-phone "+81-52-000-2202"}
+    "client-3" {:client-id "client-3"
+                :client-name "Arashi Foundry"
+                :contact-phone "+81-93-000-3303"
+                :contact-email "plant-eng@arashi-foundry.example"}}
+
+   :equipment
+   {"eq-101" {:equipment-id "eq-101"
+              :equipment-type "centrifugal process pump"
+              :model "NK-125/400"
+              :serial-number "SN-NK-8842"
+              :site-location "Kizuna plant 2 / utility bay"
+              :failure-description "mechanical seal weeping, 0.4 mm shaft runout"}
+    "eq-102" {:equipment-id "eq-102"
+              :equipment-type "rotary screw compressor"
+              :model "GA-75VSD"}
+    "eq-103" {:equipment-id "eq-103"
+              :equipment-type "back-pressure steam turbine"
+              :model "BT-2500"
+              :serial-number "SN-BT-0147"
+              :site-location "Arashi foundry / powerhouse"
+              :failure-description "governor hunting above 60% load"}
+    "eq-104" {:equipment-id "eq-104"
+              :equipment-type "vertical machining centre"
+              :model "VMC-850"}}
+
+   :technicians
+   {"tech-1" {:technician-id "tech-1"
+              :name "Rin Ogawa"
+              :skill-level :advanced
+              :certifications ["ASME-R" "NDT level II"]}
+    "tech-2" {:technician-id "tech-2"
+              :name "Sora Iida"
+              :skill-level :apprentice
+              :certifications []}}
+
+   :intakes
+   {"repair-1001" {:repair-id "repair-1001" :client-id "client-1"
+                   :equipment-id "eq-101" :status :open
+                   :risk-category :medium
+                   :summary "seal kit replacement + alignment"}
+    "repair-1002" {:repair-id "repair-1002" :client-id "client-1"
+                   :equipment-id "eq-101" :status :work-complete
+                   :risk-category :low
+                   :delivery-checks [:equipment-test-passed
+                                     :client-acceptance-signed
+                                     :safety-label-updated
+                                     :documentation-complete]
+                   :summary "bearing housing overhaul, awaiting release"}
+    "repair-1003" {:repair-id "repair-1003" :client-id "client-3"
+                   :equipment-id "eq-103" :status :open
+                   :risk-category :high
+                   :summary "turbine governor diagnosis"}
+    "repair-1004" {:repair-id "repair-1004" :client-id "client-2"
+                   :equipment-id "eq-102" :status :open
+                   :risk-category :medium
+                   :summary "compressor intake screening"}
+    "repair-1005" {:repair-id "repair-1005" :client-id "client-1"
+                   :equipment-id "eq-104" :status :open
+                   :risk-category :medium
+                   :summary "spindle bearing noise, spec sheet incomplete"}}
+
+   :safety-flags
+   {"eq-103" {:flag-id "eq-103-flag-1"
+              :equipment-id "eq-103"
+              :status :unresolved
+              :data {:concern "exposed high-voltage terminal box at governor cabinet"
+                     :raised-by "tech-1"}}}
+
+   :work-history
+   {"client-1" [{:repair-id "repair-0990" :date "2026-05-14"
+                 :summary "impeller replacement, returned to service"}]}})
+
+(def ^:private operator
+  {:actor-id "coordinator-1"
+   :actor-role :repair-coordinator
+   :phase :phase-2})
+
+(def ^:private dev-operator
+  (assoc operator :phase :phase-0))
+
+;; ----------------------------- scenario -----------------------------
+
+(defn- exec!
+  "Runs ONE operation through the real compiled actor and captures what the
+  actor itself produced. `:audit` is de-duplicated because the graph's
+  `:audit` channel uses an `into` reducer while the `:request-approval` and
+  `:commit` nodes return the whole accumulated vector -- measured, real
+  behaviour that repeats identical facts; collapsing them changes nothing
+  but the row count."
+  [actor label request context]
+  (let [state (:state (g/run* actor {:request request :context context} {}))]
+    {:label       label
+     :request     request
+     :phase       (:phase context)
+     :disposition (:disposition state)
+     :verdict     (:verdict state)
+     :record      (:record state)
+     :audit       (vec (distinct (:audit state)))}))
+
+(defn run-demo!
+  "Seeds a fresh store, builds the REAL OperationActor and drives nine
+  operations through it.
+
+  One full clean lifecycle at `:phase-2` (Full Operations, the first phase
+  that auto-approves): `client-1` is intaken, a technician is dispatched to
+  `eq-101` and a parts order is placed -- all three clear every HARD rule
+  and commit.
+
+  Four HARD governor holds that NEVER reach a human (the phase gate cannot
+  soften them -- `phase/gate` returns `:governor-hard-violation` at every
+  phase): an intake for `client-2` whose verification record has no contact
+  e-mail (`:client-unverified`), a dispatch to the under-specified `eq-104`
+  (`:equipment-unverified`), a parts order against `eq-103` whose safety
+  flag is unresolved (`:safety-flag-unresolved`), and an attempt to
+  self-certify `repair-1002` as complete (`:no-auto-certification` -- only
+  the technician who did the work may sign off).
+
+  Two escalations that DO reach a human: raising a safety concern on
+  `eq-103` (`:flag-safety-concern` always escalates, at every phase), and a
+  perfectly clean intake run at `:phase-0`, where the rollout phase itself
+  still demands approval.
+
+  Returns `{:store .. :runs [..]}` -- every value the page renders comes
+  out of these."
+  []
+  (let [db    (store/mem-store demo-seed)
+        actor (operation/build db)
+        runs  [(exec! actor "L1 · intake"
+                      {:op :intake-repair-order
+                       :subject "client-1"
+                       :details {:repair-id "repair-1001"
+                                 :equipment-id "eq-101"
+                                 :risk-category :medium}}
+                      operator)
+               (exec! actor "L1 · dispatch"
+                      {:op :schedule-technician-dispatch
+                       :subject {:client-id "client-1"
+                                 :equipment-id "eq-101"
+                                 :technician-id "tech-1"
+                                 :risk-category :medium}
+                       :details {:repair-id "repair-1001"}}
+                      operator)
+               (exec! actor "L1 · parts order"
+                      {:op :order-parts
+                       :subject {:client-id "client-1" :equipment-id "eq-101"}
+                       :details {:repair-id "repair-1001"
+                                 :part "mechanical seal kit NK-125"
+                                 :quantity 1}}
+                      operator)
+               (exec! actor "unverified client"
+                      {:op :intake-repair-order
+                       :subject "client-2"
+                       :details {:repair-id "repair-1004"}}
+                      operator)
+               (exec! actor "unverified equipment"
+                      {:op :schedule-technician-dispatch
+                       :subject {:client-id "client-1"
+                                 :equipment-id "eq-104"
+                                 :technician-id "tech-1"
+                                 :risk-category :medium}
+                       :details {:repair-id "repair-1005"}}
+                      operator)
+               (exec! actor "flagged equipment"
+                      {:op :order-parts
+                       :subject {:client-id "client-3" :equipment-id "eq-103"}
+                       :details {:repair-id "repair-1003"
+                                 :part "governor valve linkage"
+                                 :quantity 1}}
+                      operator)
+               (exec! actor "self-certification attempt"
+                      {:op :certify-repair-complete
+                       :subject "repair-1002"}
+                      operator)
+               (exec! actor "safety concern"
+                      {:op :flag-safety-concern
+                       :subject "eq-103"
+                       :details {:concern "governor cabinet interlock defeated"}}
+                      operator)
+               (exec! actor "phase-0 intake"
+                      {:op :intake-repair-order
+                       :subject "client-3"
+                       :details {:repair-id "repair-1003"}}
+                      dev-operator)]]
+    {:store db :runs runs}))
+
+;; ----------------------------- rendering -----------------------------
+
+(defn- esc [v]
+  (-> (str v)
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")))
+
+(defn- kw-name [v]
+  (if (keyword? v) (name v) (str v)))
+
+(defn- subject-label
+  "Stable, human-readable label for a request subject (a bare id string or a
+  map carrying :client-id / :equipment-id / :technician-id)."
+  [subject]
+  (if (map? subject)
+    (str/join " · " (keep #(get subject %)
+                          [:client-id :equipment-id :technician-id]))
+    (str subject)))
+
+(defn- badge [class label]
+  (format "<span class=\"%s\">%s</span>" class label))
+
+(defn- yes-no [ok?]
+  (if ok? (badge "ok" "yes") (badge "err" "no")))
+
+(defn- disposition-badge [disposition]
+  (case disposition
+    :commit   (badge "ok" "committed")
+    :hold     (badge "critical" "HARD hold")
+    :escalate (badge "warn" "escalated to human")
+    (badge "muted" (esc (kw-name disposition)))))
+
+(defn- hold-rules
+  "The governor rules that actually fired on a run, straight from the verdict."
+  [{:keys [verdict]}]
+  (mapv :rule (:violations verdict)))
+
+;; --- clients -----------------------------------------------------------
+
+(defn- client-row [db [id client]]
+  (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>"
+          (esc id)
+          (esc (:client-name client))
+          (yes-no (store/has-verified-client? db id))
+          (let [missing (sort (map kw-name
+                                   (remove #(contains? client %)
+                                           facts/client-verification-required)))]
+            (if (seq missing)
+              (badge "err" (esc (str/join ", " missing)))
+              (badge "muted" "&mdash;")))))
+
+;; --- equipment ---------------------------------------------------------
+
+(defn- equipment-row [db [id equip]]
+  (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+          (esc id)
+          (esc (:equipment-type equip))
+          (esc (or (:model equip) ""))
+          (yes-no (store/has-verified-equipment? db id))
+          (if (store/safety-flag-exists? db id)
+            (badge "critical" "unresolved safety flag")
+            (badge "muted" "none"))))
+
+;; --- intakes -----------------------------------------------------------
+
+(defn- intake-row [db [id intake]]
+  (format "        <tr><td><code>%s</code></td><td><code>%s</code></td><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+          (esc id)
+          (esc (:client-id intake))
+          (esc (:equipment-id intake))
+          (esc (kw-name (:risk-category intake)))
+          (esc (kw-name (:status intake)))
+          (yes-no (store/repair-work-complete? db id))
+          (if (store/repair-safely-deliverable? db id)
+            (badge "ok" "safe to deliver")
+            (badge "muted" (esc (str (count (:delivery-checks intake []))
+                                     "/" (count facts/safe-delivery-checklist)
+                                     " delivery checks"))))))
+
+;; --- operation runs ----------------------------------------------------
+
+(defn- run-row [{:keys [label request phase disposition] :as run}]
+  (let [rules (hold-rules run)]
+    (format "        <tr><td>%s</td><td><code>%s</code></td><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
+            (esc label)
+            (esc (kw-name (:op request)))
+            (esc (subject-label (:subject request)))
+            (esc (kw-name phase))
+            (disposition-badge disposition)
+            (if (seq rules)
+              (esc (str/join ", " (map kw-name rules)))
+              (badge "muted" "&mdash;")))))
+
+(defn- kv-list
+  "Stable rendering of a small proposal-value map (sorted by key name)."
+  [m]
+  (if (map? m)
+    (str/join " · " (for [[k v] (sort-by (comp kw-name key) m)]
+                      (str (kw-name k) "=" (if (keyword? v) (kw-name v) v))))
+    (str m)))
+
+(defn- record-row [{:keys [label record request]}]
+  (format "        <tr><td>%s</td><td><code>%s</code></td><td><code>%s</code></td><td>%s</td></tr>"
+          (esc label)
+          (esc (kw-name (:effect record)))
+          (esc (subject-label (first (:path record))))
+          (esc (let [v (kv-list (:value record))]
+                 (if (str/blank? v)
+                   (str "(no details on " (kw-name (:op request)) " request)")
+                   v)))))
+
+(defn- violation-row [{:keys [label request] :as run}]
+  (str/join "\n"
+            (for [{:keys [rule detail]} (get-in run [:verdict :violations])]
+              (format "        <tr><td>%s</td><td><code>%s</code></td><td><code>%s</code></td><td>%s</td></tr>"
+                      (esc label)
+                      (esc (kw-name (:op request)))
+                      (esc (kw-name rule))
+                      (esc detail)))))
+
+;; --- audit facts -------------------------------------------------------
+
+(defn- audit-row [{:keys [t op subject reason confidence basis summary status]}]
+  (format "        <tr><td><code>%s</code></td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
+          (esc (kw-name t))
+          (esc (kw-name (or op :n-a)))
+          (esc (subject-label subject))
+          (esc (or (some->> (seq basis) (map kw-name) (str/join ", "))
+                   (some-> reason kw-name)
+                   (some-> status kw-name)
+                   (when confidence (str "confidence " confidence))
+                   summary
+                   ""))))
+
+;; --- governor rule matrix (derived from the live vars) -----------------
+
+(def ^:private matrix-ops
+  [:intake-repair-order :schedule-technician-dispatch :order-parts
+   :flag-safety-concern :certify-repair-complete :certify-safe-to-operate])
+
+(defn- gate-row [op]
+  (let [phase-2      (get phase/phase-definitions :phase-2)
+        allowed?     (contains? (:allowed-ops phase-2) op)
+        cert-block?  (contains? #{:certify-repair-complete :certify-safe-to-operate} op)
+        checks       (cond-> []
+                       (contains? governor/requires-verified-client op)
+                       (conj "client verified")
+                       (contains? governor/requires-verified-equipment op)
+                       (conj "equipment verified")
+                       (contains? governor/requires-verified-equipment op)
+                       (conj "no unresolved safety flag")
+                       (= op :schedule-technician-dispatch)
+                       (conj "technician skill")
+                       cert-block?
+                       (conj "technician sign-off required"))]
+    (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
+            (esc (kw-name op))
+            (esc (if (seq checks) (str/join " · " checks) "—"))
+            (cond
+              cert-block?
+              (badge "critical" "ALWAYS HARD hold &middot; actor may never certify")
+              (contains? governor/escalation-required op)
+              (badge "warn" "ALWAYS escalates to a human &middot; every phase")
+              (not allowed?)
+              (badge "muted" "not permitted at phase-2")
+              :else
+              (badge "ok" "auto-commits at phase-2 when every HARD rule clears")))))
+
+(defn- phase-row [[phase {:keys [name allowed-ops requires-approval? auto-approve?]}]]
+  (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+          (esc (kw-name phase))
+          (esc name)
+          (esc (count allowed-ops))
+          (if requires-approval? (badge "warn" "every op") (badge "muted" "only escalations"))
+          (if auto-approve? (badge "ok" "yes") (badge "muted" "no"))))
+
+;; --- document ----------------------------------------------------------
+
+(defn render
+  "Renders the whole operator console from a `run-demo!` result. Only
+  formatting happens here -- every value was produced by the actor run."
+  [{:keys [store runs]}]
+  (let [db          store
+        ledger      (vec (store/ledger db))
+        tally       (frequencies (map :status ledger))
+        holds       (filter #(= :hold (:disposition %)) runs)
+        commits     (filter #(= :commit (:disposition %)) runs)
+        escalations (filter #(= :escalate (:disposition %)) runs)
+        ;; NOT `distinct` across runs: two runs legitimately emit the
+        ;; identical `{:t :operation-complete :status :committed}` fact and
+        ;; collapsing them would under-report the ledger. De-duplication
+        ;; happens per run, in `exec!`, where the repetition is an artifact.
+        audit       (vec (mapcat :audit runs))
+        clients     (sort-by key (into {} (map (fn [id] [id (store/client-record db id)])
+                                               (keys (:clients demo-seed)))))
+        equipment   (sort-by key (into {} (map (fn [id] [id (store/equipment-record db id)])
+                                               (keys (:equipment demo-seed)))))
+        intakes     (sort-by key (into {} (map (fn [id] [id (store/repair-intake db id)])
+                                               (keys (:intakes demo-seed)))))
+        open-count  (count (store/all-open-intakes db))]
+    (str
+     "<html lang=\"en\"><head><meta charset=\"utf-8\">"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+     "<title>cloud-itonami-isic-3312 &middot; machinery repair operator console</title><style>"
+     (jp-go-dds.skin/dds+skin)
+     "</style></head><body>\n"
+     "<header class=\"bar\">\n"
+     "  <h1>Repair of machinery (ISIC 3312) — Operator Console</h1>\n"
+     "  <span class=\"badge\">read-only sample · governor-gated · repair &amp; safety certification is technician-only, never the actor</span>\n"
+     "</header>\n"
+     "<main>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>This run</h2>\n"
+     "    <p class=\"muted\">Build-time output of <code>machinery-repair.render-html</code> (<code>clojure -M:dev:render-html</code>): a fresh <code>machinery-repair.store</code> MemStore driven through the real <code>machinery-repair.operation</code> langgraph actor. Every figure below is what the actor actually returned — nothing is transcribed by hand.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Operations run</th><th>Committed</th><th>HARD holds</th><th>Escalated to a human</th><th>Ledger facts</th><th>Open intakes</th></tr></thead>\n"
+     "      <tbody>\n"
+     (format "        <tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+             (count runs)
+             (badge "ok" (str (count commits)))
+             (badge "critical" (str (count holds)))
+             (badge "warn" (str (count escalations)))
+             (count ledger)
+             open-count)
+     "\n      </tbody>\n"
+     "    </table>\n"
+     (format "    <p class=\"muted\">Store append-only ledger tally (<code>machinery-repair.store/ledger</code>): committed %s · held %s · escalated %s.</p>\n"
+             (esc (get tally :committed 0))
+             (esc (get tally :held 0))
+             (esc (get tally :escalated 0)))
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Operations (real actor runs)</h2>\n"
+     "    <p class=\"muted\">One row per graph run: <code>:intake</code> → <code>:advise</code> → <code>:govern</code> → <code>:decide</code> → <code>:request-approval</code> | <code>:commit</code>. A HARD hold is decided by the governor and stopped by <code>machinery-repair.phase/gate</code> at every phase — it never reaches a human queue.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Scenario</th><th>Op</th><th>Subject</th><th>Phase</th><th>Disposition</th><th>Rules fired</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map run-row runs)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>HARD holds — governor detail</h2>\n"
+     "    <p class=\"muted\">The exact <code>:detail</code> string each violated rule produced. These proposals were never queued for approval.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Scenario</th><th>Op</th><th>Rule</th><th>Governor detail</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map violation-row holds)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Committed records</h2>\n"
+     "    <p class=\"muted\">What each committed run actually handed to the SSoT — the <code>:record</code> channel of the graph run (effect, path, proposal value), not a description of it.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Scenario</th><th>Effect</th><th>Path</th><th>Value</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map record-row commits)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Repair intakes</h2>\n"
+     "    <p class=\"muted\">Work-complete and safe-to-deliver are live <code>store/repair-work-complete?</code> / <code>store/repair-safely-deliverable?</code> queries against <code>facts/safe-delivery-checklist</code>.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Repair</th><th>Client</th><th>Equipment</th><th>Risk</th><th>Status</th><th>Work complete</th><th>Delivery</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map (partial intake-row db) intakes)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Equipment</h2>\n"
+     "    <p class=\"muted\">Verification is <code>store/has-verified-equipment?</code> against <code>facts/equipment-verification-required</code>; the flag column is <code>store/safety-flag-exists?</code>.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Equipment</th><th>Type</th><th>Model</th><th>Verified</th><th>Safety flag</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map (partial equipment-row db) equipment)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Clients</h2>\n"
+     "    <p class=\"muted\">Verification is <code>store/has-verified-client?</code>; the last column lists the fields of <code>facts/client-verification-required</code> the record is missing.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Client</th><th>Name</th><th>Verified</th><th>Missing fields</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map (partial client-row db) clients)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Action gate (Machinery Repair Governor)</h2>\n"
+     "    <p class=\"muted\">Derived from the live <code>governor/requires-verified-client</code>, <code>governor/requires-verified-equipment</code>, <code>governor/escalation-required</code> and <code>phase/phase-definitions</code> vars — not a hand-written description.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Op</th><th>HARD checks</th><th>Gate at phase-2</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map gate-row matrix-ops)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Rollout phases</h2>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Phase</th><th>Name</th><th>Ops allowed</th><th>Human approval</th><th>Auto-approve</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map phase-row (sort-by key phase/phase-definitions))) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Audit ledger (this run)</h2>\n"
+     "    <p class=\"muted\">Decision facts emitted by the actor's <code>:audit</code> channel across all runs, in order.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Fact</th><th>Op</th><th>Subject</th><th>Basis</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map audit-row audit)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+     "</main>\n"
+     "<footer>cloud-itonami-isic-3312 · generated by <code>clojure -M:dev:render-html</code> · deterministic, no timestamps</footer>\n"
+     "</body></html>\n")))
+
+(defn -main [& args]
+  (let [out    (or (first args) "docs/samples/operator-console.html")
+        result (run-demo!)
+        html   (render result)]
+    (spit out html)
+    (println "wrote" out
+             (str "(" (count (:runs result)) " actor runs, "
+                  (count (store/ledger (:store result))) " ledger facts, "
+                  (count (filter #(= :hold (:disposition %)) (:runs result)))
+                  " HARD holds)"))))

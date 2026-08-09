@@ -41,7 +41,13 @@
   "All intake/dispatch/parts operations require a verified client record."
   [{:keys [op subject]} st]
   (when (contains? requires-verified-client op)
-    (let [client-id (or subject (:client-id subject))]
+    ;; `subject` is either a bare client-id string (:intake-repair-order) or a
+    ;; map carrying :client-id (:schedule-technician-dispatch / :order-parts).
+    ;; Prefer the map key, exactly like `unverified-equipment-violations`
+    ;; below -- reading `subject` first made every map-shaped subject resolve
+    ;; to the whole map, so dispatch and parts orders could NEVER clear this
+    ;; rule no matter how well verified the client was.
+    (let [client-id (or (:client-id subject) subject)]
       (when-not (store/has-verified-client? st client-id)
         [{:rule :client-unverified
           :detail (str "Client " client-id " is not yet fully verified; "
