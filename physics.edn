@@ -1,0 +1,44 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README "Robotics premise": diagnostic-scanning, teardown/reassembly-assist
+;; and NDT-inspection robots repair and overhaul existing industrial
+;; equipment (pumps, compressors, turbines) under an actor that proposes and
+;; an independent Machinery Repair Governor that gates (no return to service
+;; without a completed inspection). The physical work: lifting a pump rotor
+;; out during teardown, heating a replacement bearing for its shrink fit, and
+;; the post-repair pump test loop.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-3312"
+ :cases
+ [{:id :lift-pump-rotor-out
+   :kind :manipulator
+   :procedure "teardown-assist arm lifts the impeller-and-shaft rotor out of an opened centrifugal-pump casing and lays it on the V-block stand"
+   :params {:l1-m 0.90 :l2-m 0.80 :m1-kg 30.0 :m2-kg 20.0
+            :from [0.70 -0.20] :to [1.10 0.40] :duration-s 5.0 :steps 500}
+   :sweep {:param :payload-kg :values [10.0 25.0 40.0 60.0 80.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 1200.0 :basis "estimate: continuous shoulder torque of a ~80 kg-payload industrial arm class"}
+   :boundary {:lo 2.0 :hi 250.0}}
+  {:id :bearing-shrink-fit-heating
+   :kind :thermal
+   :procedure "replacement rolling bearing heats in a 120 C bearing oven until its inner ring reaches 110 C for the shrink fit onto the shaft. Half the ring section is modelled with an adiabatic (symmetry) back face, so the back face is the section centre"
+   :params {:conductivity-w-mk 45.0 :density-kg-m3 7800.0 :specific-heat-j-kgk 470.0
+            :t0-c 20.0 :t-hot-c 120.0 :h-front-w-m2k 15.0 :h-back-w-m2k 0.0
+            :threshold-c 110.0 :duration-s 14400.0 :nodes 7}
+   :sweep {:param :thickness-m :values [0.005 0.010 0.015 0.025 0.040]}
+   :quantity :time-to-threshold-s
+   :limit {:max 3600.0 :basis "estimate: one hour of oven time per bearing inside the overhaul's reassembly slot; oven h = 15 W/m2K is an estimate"}
+   :boundary {:lo 0.002 :hi 0.08}}
+  {:id :post-repair-pump-test-loop
+   :kind :pipe-flow
+   :procedure "repaired pump runs on the test bench's closed loop (DN80, 25 m equivalent length incl. the throttle valve at its test setting) to confirm duty-point flow"
+   :params {:diameter-m 0.080 :length-m 25.0 :roughness-m 4.5e-5
+            :density-kg-m3 998.0 :viscosity-pa-s 1.0e-3 :pump-efficiency 0.70 :elevation-m 0.0}
+   :sweep {:param :q-m3s :values [0.005 0.010 0.015 0.020 0.030]}
+   :quantity :head-m
+   :limit {:max 3.0 :basis "estimate: the loop's own friction head must stay below ~3 m so the throttle valve, not the piping, sets the test duty point"}
+   :boundary {:lo 0.001 :hi 0.06}}]}
