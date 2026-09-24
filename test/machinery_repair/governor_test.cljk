@@ -1,5 +1,5 @@
 (ns machinery-repair.governor-test
-  (:require [clojure.test :refer [deftest testing is]]
+  (:require [kotoba.test :refer [deftest testing is]]
             [machinery-repair.governor :as governor]
             [machinery-repair.store :as store]))
 

@@ -1,5 +1,5 @@
 (ns machinery-repair.store-test
-  (:require [clojure.test :refer [deftest testing is]]
+  (:require [kotoba.test :refer [deftest testing is]]
             [machinery-repair.store :as store]))
 
 (deftest mem-store-empty
