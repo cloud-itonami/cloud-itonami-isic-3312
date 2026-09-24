@@ -1,5 +1,5 @@
 (ns machinery-repair.operation-test
-  (:require [clojure.test :refer [deftest testing is]]
+  (:require [kotoba.test :refer [deftest testing is]]
             [langgraph.graph :as g]
             [machinery-repair.operation :as operation]
             [machinery-repair.store :as store]))
